@@ -86,10 +86,11 @@ class Gateway:
             stats.succeeded += 1
             return result
         except GatewayError as exc:
-            if exc.reason in (Reason.QUEUE_FULL, Reason.WAIT_TIMEOUT):
-                stats.rejected += 1
-            else:
+            # failed 仅计后端/降级失败；路由、背压、生命周期问题计 rejected
+            if exc.reason in (Reason.BACKEND_ERROR, Reason.FALLBACK_UNAVAILABLE):
                 stats.failed += 1
+            else:
+                stats.rejected += 1
             raise
         finally:
             async with self._inflight_cond:
@@ -137,14 +138,12 @@ class Gateway:
             except BackendError:
                 pass
             # 6. 降级链：目标可用性真实反映，不可用则明确失败
-            tried_fallback = False
             for fb_version in model_spec.fallback:
                 if self._registry.is_retired(model, fb_version):
-                    continue
+                    continue  # 已下线的降级目标真实跳过
                 fb_spec = model_spec.versions.get(fb_version)
                 if fb_spec is None:
                     continue
-                tried_fallback = True
                 try:
                     result = await self._batch.submit(
                         (model, fb_version), prompt, self._backends[(model, fb_version)].infer_batch
@@ -155,7 +154,7 @@ class Gateway:
                 # 缓存键使用实际产生结果的版本
                 self._cache.put(model, fb_version, prompt, result)
                 return result
-            if tried_fallback:
+            if model_spec.fallback:
                 raise GatewayError(
                     Reason.FALLBACK_UNAVAILABLE, f"all fallbacks unavailable for {model!r}"
                 )
