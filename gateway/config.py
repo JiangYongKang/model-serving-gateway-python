@@ -16,13 +16,23 @@ class VersionSpec:
 
 
 @dataclass(frozen=True)
+class BreakerConfig:
+    """单版本自动止损参数：观察窗口内失败比例达到阈值即停止该版本放量。"""
+
+    failure_ratio: float = 0.5   # 失败比例阈值（0~1，达到即触发）
+    window: int = 20             # 观察窗口（最近 N 个终态请求，不含拒绝）
+
+
+@dataclass(frozen=True)
 class ModelSpec:
-    """模型：若干版本 + 别名 + 降级链。"""
+    """模型：若干版本 + 别名（可加权多版本）+ 降级链 + 自动止损。"""
 
     name: str
     versions: dict[str, VersionSpec] = field(default_factory=dict)
-    aliases: dict[str, str] = field(default_factory=dict)   # alias -> version
+    aliases: dict[str, str] = field(default_factory=dict)   # alias -> version（兼容写法，等价权重 1）
     fallback: tuple[str, ...] = ()  # 降级目标版本（按序尝试）
+    alias_weights: dict[str, dict[str, float]] = field(default_factory=dict)  # alias -> {version: weight}
+    breakers: dict[str, BreakerConfig] = field(default_factory=dict)  # version -> 止损配置
 
 
 @dataclass(frozen=True)

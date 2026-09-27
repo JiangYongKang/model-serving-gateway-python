@@ -4,6 +4,7 @@ from __future__ import annotations
 from gateway.config import (
     AdmissionConfig,
     BatchConfig,
+    BreakerConfig,
     CacheConfig,
     GatewayConfig,
     ModelSpec,
@@ -23,7 +24,11 @@ def demo_config() -> GatewayConfig:
                     "v0": VersionSpec(version="v0", latency_ms=5.0, retired=True),
                 },
                 aliases={"latest": "v2", "stable": "v1"},
+                # 灰度放量：canary 别名下 v2 承接 90%、v1 承接 10%
+                alias_weights={"canary": {"v2": 9.0, "v1": 1.0}},
                 fallback=("v1",),
+                # 自动止损：v2 最近 20 个终态请求失败比例达 50% 即停止放量
+                breakers={"v2": BreakerConfig(failure_ratio=0.5, window=20)},
             ),
             "summarizer": ModelSpec(
                 name="summarizer",

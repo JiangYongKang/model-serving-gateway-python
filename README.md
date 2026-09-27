@@ -19,8 +19,12 @@ HTTP 接口：
 |---|---|---|
 | POST | `/infer` | 推理：`{"model", "prompt", "version"?, "request_id"?}` |
 | GET | `/ready` | 就绪状态（反映后端真实可用性） |
-| GET | `/stats` | 用量统计 |
-| POST | `/admin/alias` | 切换别名：`{"model", "alias", "version"}` |
+| GET | `/stats` | 整体用量统计 |
+| GET | `/stats/versions` | 分版本观测统计（承接/成功/失败/拒绝/降级/实际推理） |
+| POST | `/admin/alias` | 切换别名（单版本，等价权重 1）：`{"model", "alias", "version"}` |
+| POST | `/admin/weights` | 灰度放量：`{"model", "alias", "weights": {"v1": 1, "v2": 3}}` |
+| POST | `/admin/rollback` | 一键回退：`{"model", "alias", "version"}`，返回被撤销版本列表 |
+| POST | `/admin/breaker` | 配置自动止损：`{"model", "version", "failure_ratio", "window"}` |
 | POST | `/admin/retire` | 下线版本：`{"model", "version"}` |
 
 错误响应统一为 `{"detail": {"reason": <原因码>, "message": <说明>}}`。
@@ -28,11 +32,39 @@ HTTP 接口：
 ## 路由与别名规则
 
 - 请求可指定**精确版本**或**别名**；精确版本优先于同名别名；未指定时使用别名 `latest`。
-- 单个请求只在入口解析一次别名，之后固定使用该版本——**别名切换过程中单请求绝不跨版本混合**。
+- 单个请求只在入口解析一次别名，之后固定使用该版本——**别名切换/权重调整过程中单请求绝不跨版本混合**。
 - 拒绝原因可区分：
   - `unknown_model`（404）：模型不存在；
   - `unknown_version`（404）：版本/别名不存在，或别名指向缺失版本；
-  - `version_retired`（410）：版本已下线（含别名指向已下线版本）。
+  - `version_retired`（410）：版本已下线（含别名指向已下线版本）；
+  - `version_tripped`（503）：别名下所有版本均已触发自动止损。
+
+## 灰度放量（加权多版本分流）
+
+- 别名可同时指向多个版本并按权重分流：`ModelSpec.alias_weights = {"canary": {"v2": 9, "v1": 1}}`，
+  或运行期 `POST /admin/weights` 热更新；新到达的请求立即按最新配置分流。
+- 权重为 0、已下线、已触发止损的版本不参与分流；其余版本按剩余权重比例承接。
+- 旧配置完全兼容：`aliases: {"latest": "v2"}` 与 `POST /admin/alias` 等价于单版本权重 1。
+- 足够多的独立请求的分流分布接近配置权重（见 `test_rollout.py` 分布断言）。
+
+## 自动止损（分版本观测 + 熔断）
+
+- 分版本观测（`GET /stats/versions`）：每个版本承接请求数、成功、失败、拒绝、
+  降级次数与实际执行的推理次数；各版本合计与整体口径一致（守恒），
+  在并发、重复提交与降级场景下同样成立。
+- 止损配置（`ModelSpec.breakers` 或 `POST /admin/breaker`）：`failure_ratio` +
+  `window`（最近 N 个终态请求，排队拒绝不计入窗口）。窗口内失败比例达到阈值即
+  自动把该版本从所有别名分流中摘除，其余版本继续正常服务。
+- 止损只影响新请求的分流选择：**在途请求正常结束**，不会出现半更新或计数错乱。
+- `Gateway.reset_breaker(model, version)` 可解除止损状态（需另行恢复权重才重新放量）。
+
+## 一键回退
+
+- `POST /admin/rollback {"model", "alias", "version"}`：立即把别名收敛为只由指定版本承接。
+- 回退后：新请求不再进入被撤销版本（显式访问得到 `version_retired`）；
+  被撤销版本此前产生的**缓存结果与去重记录被清除**，不会再被返回。
+- 回退不影响正在处理中的请求（它们已完成路由解析，正常结束）；
+  重试、降级、缓存容量上限与排队行为保持不变。
 
 ## 合批与背压配置
 
@@ -88,6 +120,9 @@ uv run pytest tests/ -q -s
 请求标识、批次与判定依据：
 
 - `test_routing.py`：未知模型/版本/已下线原因可区分；别名切换不跨版本混合；
+- `test_rollout.py`：权重分流分布接近配置；并发下权重热更新单请求不跨版本、权重 0 停止接流；
+  自动止损触发后在途请求正常收尾、其余版本继续服务；回退后旧版本缓存/去重结果不再命中；
+  分版本统计与整体统计在并发/重复提交/降级/背压下守恒；
 - `test_batching.py`：并发合批（后端调用次数 < 请求数）；不同版本不混批；单项失败不污染批；
 - `test_admission.py`：排队超限明确拒绝；慢模型不阻塞快模型；
 - `test_fallback.py`：重试计一次用量；降级到可用版本；降级不可用明确失败；
@@ -100,14 +135,15 @@ uv run pytest tests/ -q -s
 
 ```
 gateway/
-  config.py     配置（模型/版本/别名/降级链/合批/背压/缓存/重试）
+  config.py     配置（模型/版本/别名/权重/止损/降级链/合批/背压/缓存/重试）
   errors.py     原因码与 GatewayError
-  registry.py   路由与别名（运行期可切换、可下线）
+  registry.py   路由与别名（加权分流、运行期可切换、可下线、止损摘除、回退）
+  rollout.py    分版本观测统计与自动止损（熔断）
   backends.py   确定性本地后端（故障可注入）
   batching.py   动态合批器
   admission.py  资源隔离与背压
-  cache.py      有界 LRU 结果缓存
-  dedup.py      请求去重与用量统计
+  cache.py      有界 LRU 结果缓存（可按版本清除）
+  dedup.py      请求去重（按版本作用域）与用量统计
   gateway.py    编排：路由→缓存→去重→背压→合批→重试/降级→统计
   app.py        FastAPI 入口
   demo.py       演示配置

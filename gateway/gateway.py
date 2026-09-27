@@ -2,6 +2,8 @@
 
 统计守恒：每次 infer 调用 accepted +1，最终恰好落入
 succeeded / failed / rejected 之一；重试与降级不重复计 real_inferences。
+分版本统计与整体口径一致：各版本 succeeded/failed/rejected/real_inferences/
+fallbacks 之和等于整体对应计数。
 """
 from __future__ import annotations
 
@@ -11,10 +13,11 @@ from gateway.admission import Admission
 from gateway.backends import BackendError, ItemFailure, LocalBackend
 from gateway.batching import BatchScheduler
 from gateway.cache import ResultCache
-from gateway.config import GatewayConfig, ModelSpec, VersionSpec
+from gateway.config import BreakerConfig, GatewayConfig, ModelSpec, VersionSpec
 from gateway.dedup import DedupRegistry, UsageStats
 from gateway.errors import GatewayError, Reason
 from gateway.registry import Registry
+from gateway.rollout import BreakerRegistry, VersionStatsRegistry
 
 
 class Gateway:
@@ -26,6 +29,11 @@ class Gateway:
         self._batch = BatchScheduler(config.batch)
         self._dedup = DedupRegistry()
         self._stats = UsageStats()
+        self._version_stats = VersionStatsRegistry()
+        self._breakers = BreakerRegistry(self._on_breaker_trip)
+        for name, spec in config.models.items():
+            for version, bcfg in spec.breakers.items():
+                self._breakers.configure(name, version, bcfg)
         self._backends: dict[tuple[str, str], LocalBackend] = {
             (name, v): LocalBackend(name, vspec)
             for name, spec in config.models.items()
@@ -104,8 +112,31 @@ class Gateway:
         version_or_alias: str | None,
         request_id: str | None,
     ) -> str:
-        # 1. 路由（单请求只解析一次，绝不跨版本混合）
+        # 1. 路由（单请求只解析一次，绝不跨版本混合；加权别名在此选定唯一版本）
         model_spec, vspec = self._registry.resolve(model, version_or_alias)
+        vstats = self._version_stats.get(model, vspec.version)
+        vstats.requests += 1
+        try:
+            result = await self._serve(model_spec, vspec, prompt, request_id)
+        except GatewayError as exc:
+            if exc.reason in (Reason.BACKEND_ERROR, Reason.FALLBACK_UNAVAILABLE):
+                vstats.failed += 1
+                self._breakers.record(model, vspec.version, failed=True)
+            else:
+                vstats.rejected += 1  # 背压等解析后拒绝，不计入止损窗口
+            raise
+        vstats.succeeded += 1
+        self._breakers.record(model, vspec.version, failed=False)
+        return result
+
+    async def _serve(
+        self,
+        model_spec: ModelSpec,
+        vspec: VersionSpec,
+        prompt: str,
+        request_id: str | None,
+    ) -> str:
+        model = model_spec.name
         # 2. 缓存（键含解析后的具体版本）
         cached = self._cache.get(model, vspec.version, prompt)
         if cached is not None:
@@ -114,17 +145,29 @@ class Gateway:
 
         async def work() -> str:
             self._stats.real_inferences += 1  # 每个逻辑请求只计一次，重试不重复计
-            return await self._execute(model_spec, vspec, prompt)
+            executed = [vspec.version]  # 实际产生结果的版本（降级时更新）
+            try:
+                return await self._execute(model_spec, vspec, prompt, executed)
+            finally:
+                self._version_stats.get(model, executed[0]).real_inferences += 1
 
-        # 3. 去重（相同 request_id 只真实执行一次）
+        # 3. 去重（相同 request_id 只真实执行一次，作用域含解析后的版本）
         if request_id is not None:
-            result, is_leader = await self._dedup.run_once(request_id, work)
+            result, is_leader = await self._dedup.run_once(
+                (model, vspec.version), request_id, work
+            )
             if not is_leader:
                 self._stats.dedup_hits += 1
             return result
         return await work()
 
-    async def _execute(self, model_spec: ModelSpec, vspec: VersionSpec, prompt: str) -> str:
+    async def _execute(
+        self,
+        model_spec: ModelSpec,
+        vspec: VersionSpec,
+        prompt: str,
+        executed: list[str],
+    ) -> str:
         model = model_spec.name
         # 4. 背压：获取执行许可（超限/超时在此拒绝）
         await self._admission.acquire(model)
@@ -151,6 +194,8 @@ class Gateway:
                 except BackendError:
                     continue
                 self._stats.fallbacks += 1
+                self._version_stats.get(model, vspec.version).fallbacks += 1
+                executed[0] = fb_version  # 实际推理由降级目标版本执行
                 # 缓存键使用实际产生结果的版本
                 self._cache.put(model, fb_version, prompt, result)
                 return result
@@ -178,6 +223,37 @@ class Gateway:
                 last = exc
         assert last is not None
         raise last
+
+    # ---- 灰度 / 止损 / 回退 ----
+
+    def _on_breaker_trip(self, model: str, version: str) -> None:
+        """自动止损触发：把该版本从所有别名分流中摘除，其余版本继续服务。"""
+        self._registry.trip_version(model, version)
+
+    def set_breaker(self, model: str, version: str, config: BreakerConfig) -> None:
+        """运行期为某版本配置/更新自动止损参数。"""
+        if (model, version) not in self._backends:
+            raise GatewayError(Reason.UNKNOWN_VERSION, f"unknown version: {model}@{version}")
+        self._breakers.configure(model, version, config)
+
+    def reset_breaker(self, model: str, version: str) -> None:
+        """解除某版本的止损状态（需另行恢复权重才会重新放量）。"""
+        self._breakers.reset(model, version)
+        self._registry.reset_trip(model, version)
+
+    async def rollback(self, model: str, alias: str, version: str) -> list[str]:
+        """一键回退：别名收敛为单版本；撤销版本下线并清除其缓存与去重记录。
+
+        在途请求已完成路由解析，不受回退影响，正常结束。
+        """
+        revoked = self._registry.rollback(model, alias, version)
+        for v in revoked:
+            self._cache.purge_version(model, v)
+            await self._dedup.purge_scope((model, v))
+        return revoked
+
+    def version_stats_snapshot(self) -> dict[str, dict[str, int]]:
+        return self._version_stats.snapshot()
 
     # ---- 测试/管理接口 ----
 

@@ -45,6 +45,14 @@ class ResultCache:
             while len(self._store) > self._config.capacity:
                 self._store.popitem(last=False)  # 确定性淘汰最久未用项
 
+    def purge_version(self, model: str, version: str) -> int:
+        """清除某 (model, version) 的全部缓存项（回退/下线时用）。返回清除条数。"""
+        with self._lock:
+            keys = [k for k in self._store if k[0] == model and k[1] == version]
+            for k in keys:
+                del self._store[k]
+            return len(keys)
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._store)

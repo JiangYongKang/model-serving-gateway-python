@@ -10,6 +10,7 @@ class Reason(enum.Enum):
     UNKNOWN_MODEL = "unknown_model"            # 模型不存在
     UNKNOWN_VERSION = "unknown_version"        # 版本不存在
     VERSION_RETIRED = "version_retired"        # 版本已下线
+    VERSION_TRIPPED = "version_tripped"        # 版本已触发自动止损，停止放量
     UNKNOWN_ALIAS = "unknown_alias"            # 别名不存在
     QUEUE_FULL = "queue_full"                  # 排队超限（背压拒绝）
     WAIT_TIMEOUT = "wait_timeout"              # 排队等待超时
