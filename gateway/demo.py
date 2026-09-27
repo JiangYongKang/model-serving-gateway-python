@@ -4,6 +4,7 @@ from __future__ import annotations
 from gateway.config import (
     AdmissionConfig,
     BatchConfig,
+    BreakerSpec,
     CacheConfig,
     GatewayConfig,
     ModelSpec,
@@ -19,7 +20,12 @@ def demo_config() -> GatewayConfig:
                 name="echo",
                 versions={
                     "v1": VersionSpec(version="v1", latency_ms=5.0),
-                    "v2": VersionSpec(version="v2", latency_ms=5.0),
+                    "v2": VersionSpec(
+                        version="v2",
+                        latency_ms=5.0,
+                        # 灰度止损示例：最近 20 个请求失败比例达 50% 即自动停止 v2 放量
+                        breaker=BreakerSpec(failure_ratio=0.5, window=20, min_requests=10),
+                    ),
                     "v0": VersionSpec(version="v0", latency_ms=5.0, retired=True),
                 },
                 aliases={"latest": "v2", "stable": "v1"},

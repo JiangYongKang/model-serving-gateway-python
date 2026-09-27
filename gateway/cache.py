@@ -45,6 +45,14 @@ class ResultCache:
             while len(self._store) > self._config.capacity:
                 self._store.popitem(last=False)  # 确定性淘汰最久未用项
 
+    def invalidate(self, model: str, version: str) -> int:
+        """使某版本的全部缓存项失效（回退/止损时调用），返回清除条数。"""
+        with self._lock:
+            doomed = [k for k in self._store if k[0] == model and k[1] == version]
+            for k in doomed:
+                del self._store[k]
+        return len(doomed)
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._store)

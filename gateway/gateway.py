@@ -15,6 +15,7 @@ from gateway.config import GatewayConfig, ModelSpec, VersionSpec
 from gateway.dedup import DedupRegistry, UsageStats
 from gateway.errors import GatewayError, Reason
 from gateway.registry import Registry
+from gateway.rollout import RolloutMonitor
 
 
 class Gateway:
@@ -26,6 +27,7 @@ class Gateway:
         self._batch = BatchScheduler(config.batch)
         self._dedup = DedupRegistry()
         self._stats = UsageStats()
+        self._monitor = RolloutMonitor(config, halt=self._registry.halt_version)
         self._backends: dict[tuple[str, str], LocalBackend] = {
             (name, v): LocalBackend(name, vspec)
             for name, spec in config.models.items()
@@ -106,19 +108,45 @@ class Gateway:
     ) -> str:
         # 1. 路由（单请求只解析一次，绝不跨版本混合）
         model_spec, vspec = self._registry.resolve(model, version_or_alias)
+        version = vspec.version
+        mon = self._monitor
+        mon.record_request(model, version)
+        try:
+            result = await self._serve(model_spec, vspec, prompt, request_id)
+        except GatewayError as exc:
+            # 与整体统计同口径：failed 仅计后端/降级失败，其余计 rejected
+            if exc.reason in (Reason.BACKEND_ERROR, Reason.FALLBACK_UNAVAILABLE):
+                mon.record_failure(model, version)
+            else:
+                mon.record_rejected(model, version)
+            raise
+        mon.record_success(model, version)
+        return result
+
+    async def _serve(
+        self,
+        model_spec: ModelSpec,
+        vspec: VersionSpec,
+        prompt: str,
+        request_id: str | None,
+    ) -> str:
+        model, version = model_spec.name, vspec.version
         # 2. 缓存（键含解析后的具体版本）
-        cached = self._cache.get(model, vspec.version, prompt)
+        cached = self._cache.get(model, version, prompt)
         if cached is not None:
             self._stats.cache_hits += 1
             return cached
 
         async def work() -> str:
             self._stats.real_inferences += 1  # 每个逻辑请求只计一次，重试不重复计
+            self._monitor.record_inference(model, version)
             return await self._execute(model_spec, vspec, prompt)
 
-        # 3. 去重（相同 request_id 只真实执行一次）
+        # 3. 去重（相同 request_id 只真实执行一次；结果记录来源版本，回退可失效）
         if request_id is not None:
-            result, is_leader = await self._dedup.run_once(request_id, work)
+            result, is_leader = await self._dedup.run_once(
+                request_id, work, source=(model, version)
+            )
             if not is_leader:
                 self._stats.dedup_hits += 1
             return result
@@ -151,6 +179,9 @@ class Gateway:
                 except BackendError:
                     continue
                 self._stats.fallbacks += 1
+                self._monitor.record_fallback(model, vspec.version)
+                # 推理归属改到实际产出结果的版本，保持分版本合计与整体一致
+                self._monitor.reattribute_inference(model, vspec.version, fb_version)
                 # 缓存键使用实际产生结果的版本
                 self._cache.put(model, fb_version, prompt, result)
                 return result
@@ -181,9 +212,25 @@ class Gateway:
 
     # ---- 测试/管理接口 ----
 
+    async def rollback(self, model: str, alias: str, version: str) -> list[str]:
+        """一键回退：别名收敛到单个版本；被撤销版本的缓存与去重结果立即失效。
+
+        只影响新请求的路由与缓存/去重命中，在途请求正常收尾。
+        返回被撤销的版本列表。
+        """
+        revoked = self._registry.rollback(model, alias, version)
+        for v in revoked:
+            self._cache.invalidate(model, v)
+            await self._dedup.invalidate_version(model, v)
+        return revoked
+
     @property
     def registry(self) -> Registry:
         return self._registry
+
+    @property
+    def monitor(self) -> RolloutMonitor:
+        return self._monitor
 
     @property
     def backends(self) -> dict[tuple[str, str], LocalBackend]:

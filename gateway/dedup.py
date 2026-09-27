@@ -34,19 +34,21 @@ class DedupRegistry:
     def __init__(self, capacity: int = 1024) -> None:
         self._capacity = capacity
         self._inflight: dict[str, asyncio.Future] = {}
-        self._done: OrderedDict[str, tuple[bool, object]] = OrderedDict()
+        # 已完成结果记录来源 (model, version)，回退时可按版本失效
+        self._done: OrderedDict[str, tuple[bool, object, tuple[str, str] | None]] = OrderedDict()
         self._lock = asyncio.Lock()
 
     async def run_once(
         self,
         request_id: str,
         work: Callable[[], Awaitable[str]],
+        source: tuple[str, str] | None = None,
     ) -> tuple[str, bool]:
         """返回 (结果, 是否本次真实执行)；失败时抛出共享的异常。"""
         loop = asyncio.get_running_loop()
         async with self._lock:
             if request_id in self._done:
-                ok, val = self._done[request_id]
+                ok, val, _ = self._done[request_id]
                 self._done.move_to_end(request_id)
                 if ok:
                     return val, False  # type: ignore[return-value]
@@ -60,23 +62,35 @@ class DedupRegistry:
                 leader = False
 
         if not leader:
-            ok, val = await asyncio.shield(fut)
+            ok, val, _ = await asyncio.shield(fut)
             if ok:
                 return val, False
             raise val
 
         try:
             result = await work()
-            outcome: tuple[bool, object] = (True, result)
+            outcome: tuple[bool, object, tuple[str, str] | None] = (True, result, source)
         except Exception as exc:
-            outcome = (False, exc)
+            outcome = (False, exc, source)
         async with self._lock:
             self._inflight.pop(request_id, None)
             self._done[request_id] = outcome
             while len(self._done) > self._capacity:
                 self._done.popitem(last=False)
             fut.set_result(outcome)
-        ok, val = outcome
+        ok, val, _ = outcome
         if ok:
             return val, True  # type: ignore[return-value]
         raise val  # type: ignore[misc]
+
+    async def invalidate_version(self, model: str, version: str) -> int:
+        """使某版本产生的已完成结果失效（回退时调用）；在途请求不受影响，返回清除条数。"""
+        async with self._lock:
+            doomed = [
+                rid
+                for rid, (_, _, src) in self._done.items()
+                if src == (model, version)
+            ]
+            for rid in doomed:
+                del self._done[rid]
+        return len(doomed)

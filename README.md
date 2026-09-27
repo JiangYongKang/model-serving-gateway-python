@@ -21,6 +21,9 @@ HTTP 接口：
 | GET | `/ready` | 就绪状态（反映后端真实可用性） |
 | GET | `/stats` | 用量统计 |
 | POST | `/admin/alias` | 切换别名：`{"model", "alias", "version"}` |
+| POST | `/admin/weights` | 灰度放量：`{"model", "alias", "weights": {"v1": 1, "v2": 3}}` |
+| POST | `/admin/rollback` | 一键回退：`{"model", "alias", "version"}`，返回被撤销版本列表 |
+| GET | `/stats/versions` | 分版本统计（承接/成功/失败/降级/真实推理） |
 | POST | `/admin/retire` | 下线版本：`{"model", "version"}` |
 
 错误响应统一为 `{"detail": {"reason": <原因码>, "message": <说明>}}`。
@@ -32,7 +35,26 @@ HTTP 接口：
 - 拒绝原因可区分：
   - `unknown_model`（404）：模型不存在；
   - `unknown_version`（404）：版本/别名不存在，或别名指向缺失版本；
-  - `version_retired`（410）：版本已下线（含别名指向已下线版本）。
+  - `version_retired`（410）：版本已下线（含别名指向已下线版本）；
+  - `no_active_version`（503）：别名下无可用版本（全部权重为 0 / 已止损 / 已下线）。
+
+## 灰度放量、自动止损与一键回退
+
+- **权重分流**：`/admin/weights`（或 `Registry.set_alias_weights`）让别名同时指向多个版本，
+  新到达的请求按最新权重随机分流；权重为 0、已下线或已止损的版本不再接到新请求。
+  单请求从进入到返回只归属一个版本，绝不跨版本拼接或中途换版本。
+  旧配置兼容：静态 `aliases` 与 `/admin/alias` 的单版本写法等价于权重 `{version: 1}`，行为不变。
+- **分版本观测**：`GET /stats/versions` 给出每版本的承接数、成功、失败、拒绝、
+  降级次数与真实推理次数；各版本合计与 `/stats` 整体口径一致
+  （降级产生的推理归属实际产出结果的版本，守恒在并发、重复提交与降级场景下都成立）。
+- **自动止损**：给版本配置 `BreakerSpec(failure_ratio, window, min_requests)`，
+  最近 `window` 个已完成请求中失败比例达到 `failure_ratio`（且样本数 ≥ `min_requests`）时，
+  自动停止该版本的放量，其余版本继续正常服务。止损只影响新请求的分流，
+  在途请求正常收尾并继续计数。调整权重**不会**解除止损（防止无意恢复），
+  明确恢复用 `Registry.resume_version`。
+- **一键回退**：`/admin/rollback`（或 `Gateway.rollback`）把别名收敛回只由一个确定版本承接。
+  回退后新请求不再进入被撤销版本，其此前产生的缓存结果与重复提交（去重）结果立即失效、
+  不再被返回；回退不影响在途请求，也不改变重试、降级、缓存容量上限与排队行为。
 
 ## 合批与背压配置
 
@@ -94,20 +116,30 @@ uv run pytest tests/ -q -s
 - `test_cache.py`：规范化命中；版本变更使旧缓存失效；容量上限与确定性淘汰；
 - `test_dedup.py`：并发/顺序重复提交只真实推理一次；混合场景统计守恒；
 - `test_lifecycle.py`：未就绪拒绝；在途请求完成后停机；停机期间新请求拒绝；
-- `test_api.py`：HTTP 各入口与错误原因码。
+- `test_rollout.py`：权重分布接近配置；并发下权重热更新分流一致；权重 0 版本不接新请求；
+  自动止损触发时在途请求正常收尾；回退后旧版本缓存/去重结果不再命中；
+  并发+去重+降级混合场景下分版本统计与整体守恒；
+- `test_api.py`：HTTP 各入口与错误原因码；灰度放量/回退/分版本统计端点。
+
+本地复现灰度与回退（无需启动服务）：
+
+```bash
+uv run pytest tests/test_rollout.py -q -s   # 日志含权重分布、止损与回退的判定依据
+```
 
 ## 代码结构
 
 ```
 gateway/
-  config.py     配置（模型/版本/别名/降级链/合批/背压/缓存/重试）
+  config.py     配置（模型/版本/别名/降级链/合批/背压/缓存/重试/止损）
   errors.py     原因码与 GatewayError
-  registry.py   路由与别名（运行期可切换、可下线）
+  registry.py   路由与别名（多版本权重分流、止损、回退，运行期可热更新）
+  rollout.py    分版本统计与滑动窗口自动止损
   backends.py   确定性本地后端（故障可注入）
   batching.py   动态合批器
   admission.py  资源隔离与背压
-  cache.py      有界 LRU 结果缓存
-  dedup.py      请求去重与用量统计
+  cache.py      有界 LRU 结果缓存（可按版本失效）
+  dedup.py      请求去重与用量统计（结果记录来源版本，可按版本失效）
   gateway.py    编排：路由→缓存→去重→背压→合批→重试/降级→统计
   app.py        FastAPI 入口
   demo.py       演示配置

@@ -11,6 +11,7 @@ class Reason(enum.Enum):
     UNKNOWN_VERSION = "unknown_version"        # 版本不存在
     VERSION_RETIRED = "version_retired"        # 版本已下线
     UNKNOWN_ALIAS = "unknown_alias"            # 别名不存在
+    NO_ACTIVE_VERSION = "no_active_version"    # 别名下无可用版本（权重为 0 / 已止损 / 已下线）
     QUEUE_FULL = "queue_full"                  # 排队超限（背压拒绝）
     WAIT_TIMEOUT = "wait_timeout"              # 排队等待超时
     SHUTTING_DOWN = "shutting_down"            # 停机中，拒绝新请求

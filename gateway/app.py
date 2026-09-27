@@ -24,6 +24,7 @@ _STATUS_BY_REASON = {
     Reason.UNKNOWN_VERSION: 404,
     Reason.UNKNOWN_ALIAS: 404,
     Reason.VERSION_RETIRED: 410,
+    Reason.NO_ACTIVE_VERSION: 503,
     Reason.QUEUE_FULL: 429,
     Reason.WAIT_TIMEOUT: 429,
     Reason.NOT_READY: 503,
@@ -49,6 +50,18 @@ class AliasRequest(BaseModel):
 
 class RetireRequest(BaseModel):
     model: str
+    version: str
+
+
+class WeightsRequest(BaseModel):
+    model: str
+    alias: str
+    weights: dict[str, float]
+
+
+class RollbackRequest(BaseModel):
+    model: str
+    alias: str
     version: str
 
 
@@ -96,5 +109,19 @@ def create_app(config: GatewayConfig | None = None) -> FastAPI:
     async def retire(req: RetireRequest) -> dict[str, str]:
         gateway.registry.retire_version(req.model, req.version)
         return {"status": "ok"}
+
+    @app.post("/admin/weights")
+    async def set_weights(req: WeightsRequest) -> dict[str, str]:
+        gateway.registry.set_alias_weights(req.model, req.alias, req.weights)
+        return {"status": "ok"}
+
+    @app.post("/admin/rollback")
+    async def rollback(req: RollbackRequest) -> dict[str, object]:
+        revoked = await gateway.rollback(req.model, req.alias, req.version)
+        return {"status": "ok", "revoked": revoked}
+
+    @app.get("/stats/versions")
+    async def stats_versions() -> dict[str, dict[str, int]]:
+        return gateway.monitor.snapshot()
 
     return app

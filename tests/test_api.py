@@ -56,3 +56,30 @@ async def test_alias_switch_over_http(client):
 async def test_ready_endpoint(client):
     r = await client.get("/ready")
     assert r.status_code == 200 and r.json()["ready"] is True
+
+
+async def test_weights_rollback_and_version_stats_over_http(client):
+    # 灰度放量：latest 按 1:1 指向 v1/v2
+    r = await client.post(
+        "/admin/weights",
+        json={"model": "m", "alias": "latest", "weights": {"v1": 1.0, "v2": 1.0}},
+    )
+    assert r.status_code == 200
+    for i in range(6):
+        ri = await client.post(
+            "/infer", json={"model": "m", "prompt": f"g-{i}", "request_id": f"ra-g{i}"}
+        )
+        assert ri.status_code == 200
+    vs = (await client.get("/stats/versions")).json()
+    log.info("stats/versions=%s", vs)
+    assert vs["m@v1"]["requests"] + vs["m@v2"]["requests"] == 6
+
+    # 一键回退到 v1：v2 被撤销，新请求全部走 v1
+    r = await client.post(
+        "/admin/rollback", json={"model": "m", "alias": "latest", "version": "v1"}
+    )
+    assert r.status_code == 200 and r.json()["revoked"] == ["v2"]
+    r2 = await client.post("/infer", json={"model": "m", "prompt": "g-new", "request_id": "ra-gn"})
+    assert r2.json()["result"].startswith("m@v1#")
+    s = (await client.get("/stats")).json()
+    assert s["accepted"] == s["succeeded"] + s["failed"] + s["rejected"]

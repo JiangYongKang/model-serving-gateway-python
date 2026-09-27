@@ -5,6 +5,15 @@ from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
+class BreakerSpec:
+    """灰度期自动止损：观察最近 window 个请求，失败比例达阈值即停止该版本放量。"""
+
+    failure_ratio: float = 0.5   # 失败比例阈值（达到即触发止损）
+    window: int = 20             # 观察窗口（最近 N 个已完成请求）
+    min_requests: int = 10       # 窗口内最少样本数（不足不判定）
+
+
+@dataclass(frozen=True)
 class VersionSpec:
     """单个模型版本的后端行为描述（确定性模拟）。"""
 
@@ -13,6 +22,7 @@ class VersionSpec:
     retired: bool = False            # 是否已下线
     fail_rate: float = 0.0           # 模拟后端故障概率（0~1，确定性注入用）
     fail_prompts: frozenset[str] = frozenset()  # 对特定输入确定性失败
+    breaker: BreakerSpec | None = None          # 灰度止损配置（None = 不启用）
 
 
 @dataclass(frozen=True)
