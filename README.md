@@ -60,11 +60,27 @@ HTTP 接口：
 
 ## 一键回退
 
-- `POST /admin/rollback {"model", "alias", "version"}`：立即把别名收敛为只由指定版本承接。
-- 回退后：新请求不再进入被撤销版本（显式访问得到 `version_retired`）；
-  被撤销版本此前产生的**缓存结果与去重记录被清除**，不会再被返回。
-- 回退不影响正在处理中的请求（它们已完成路由解析，正常结束）；
-  重试、降级、缓存容量上限与排队行为保持不变。
+- `POST /admin/rollback {"model", "alias", "version"}`：立即把**目标别名**收敛为只由指定版本承接，
+  返回该别名上被撤销的版本列表。
+- **作用范围只限目标别名**，不做任何全局状态变更：
+  - 其它别名（包括另一个仍指向被撤销版本的别名）与回退前完全一致，继续承接同一版本，正常返回；
+  - 被撤销版本**不会被下线**：显式指定该版本、或经由其它别名访问照常服务；
+  - **降级链不受影响**：保留版本后端故障时仍按配置降级到被撤销但仍可用的版本并成功返回，
+    只有降级目标确实都不可用时才以 `fallback_unavailable` 明确失败；
+  - 重试、缓存容量上限与排队行为保持不变。
+- 被撤销版本此前产生的**缓存结果与重复提交（request_id）记录被清除**，不会再被返回；
+  以“版本代际”实现：回退使被撤销版本代际 +1，旧代际下尚未结束的在途去重记录会被**封闭**——
+  已在等待的提交照常拿到在途结果收尾，回退之后才到达的同一 request_id 提交在保留版本上重新执行。
+- 回退不影响正在处理中的请求（它们已完成路由解析，正常结束），分版本与整体计数保持守恒。
+
+## 灰度下的重复提交幂等语义
+
+- 相同 `request_id` 的去重作用域是 **(model, request_id)，与落到哪个版本无关**：
+  灰度加权分流、权重热更新期间，同一 `request_id` 的多次提交（含并发落到不同版本）
+  **只真实推理一次**，所有提交得到**同一个结果**（跟随领导者的同一次执行）。
+- 权重热更新不改变这一语义；只有回退（语义边界变更）才会使被撤销版本的旧结果失效
+  并允许同一 `request_id` 在保留版本上重新执行（见“一键回退”）。
+- 不同 `request_id` 但规范化后相同的输入，仍按 `(model, version, prompt)` 共享版本缓存。
 
 ## 合批与背压配置
 
@@ -97,8 +113,10 @@ HTTP 接口：
 
 ## 去重与用量统计
 
-- 相同 `request_id` 的提交（并发在途或已完成）只产生**一次真实推理**：
-  在途共享同一 future，已完成直接返回记录的结果（有界 LRU，容量 1024）。
+- 相同 `request_id` 的提交（并发在途或已完成）只产生**一次真实推理**，
+  作用域为 `(model, request_id)`，**跨灰度版本同样成立**：
+  在途共享同一 future，已完成直接返回记录的结果（有界 LRU，容量 1024）；
+  回退会按版本代际清除/封闭旧结果（见“一键回退”）。
 - 统计守恒：`accepted = succeeded + failed + rejected`。
   - `failed` 仅计后端/降级失败；路由、背压、生命周期拒绝计 `rejected`；
   - 失败请求**不计入成功用量**；重试/降级/去重不重复计 `real_inferences`。
@@ -116,13 +134,50 @@ HTTP 接口：
 uv run pytest tests/ -q -s
 ```
 
+针对本次修复场景的本地手工复现（先 `uv run uvicorn main:app` 启动演示服务）：
+
+```bash
+# 1) 灰度别名两版本加权；另一个别名 stable 单独指向旧版本
+curl -s localhost:8000/admin/weights -H content-type:application/json \
+  -d '{"model":"echo","alias":"canary","weights":{"v1":1,"v2":1}}'
+curl -s localhost:8000/infer -H content-type:application/json \
+  -d '{"model":"echo","prompt":"p","version":"stable","request_id":"a"}'   # 仍走 v1
+
+# 2) 同一 request_id 并发重复提交（可在两个终端同时执行），结果一致、只真实推理一次
+curl -s localhost:8000/infer -H content-type:application/json \
+  -d '{"model":"echo","prompt":"p","version":"canary","request_id":"dup"}'
+# 观察 GET /stats/versions：real_inferences 只增加一次；GET /stats 中 dedup_hits 增加
+
+# 3) 一键回退 canary 到 v1
+curl -s localhost:8000/admin/rollback -H content-type:application/json \
+  -d '{"model":"echo","alias":"canary","version":"v1"}'                   # {"revoked":["v2"]}
+
+# 4) 未参与回退的别名与显式访问照常服务
+curl -s localhost:8000/infer -H content-type:application/json \
+  -d '{"model":"echo","prompt":"p","version":"stable","request_id":"b"}'  # 仍正常返回 v1 结果
+curl -s localhost:8000/infer -H content-type:application/json \
+  -d '{"model":"echo","prompt":"p","version":"v2","request_id":"c"}'      # 显式 v2 仍可用
+
+# 5) 旧 request_id 经回退后别名重新提交：不再返回旧 v2 结果，而在 v1 重新执行
+curl -s localhost:8000/infer -H content-type:application/json \
+  -d '{"model":"echo","prompt":"p","version":"canary","request_id":"dup"}' # 结果前缀变为 echo@v1#
+
+# 6) 自动测试稳定复现并断言以上行为（含回退后降级链与在途收尾/统计守恒）
+uv run pytest tests/test_rollout.py -q -s
+```
+
 测试以并发、重复提交、队列超限、版本切换与降级为主，日志中打印
 请求标识、批次与判定依据：
 
 - `test_routing.py`：未知模型/版本/已下线原因可区分；别名切换不跨版本混合；
 - `test_rollout.py`：权重分流分布接近配置；并发下权重热更新单请求不跨版本、权重 0 停止接流；
-  自动止损触发后在途请求正常收尾、其余版本继续服务；回退后旧版本缓存/去重结果不再命中；
-  分版本统计与整体统计在并发/重复提交/降级/背压下守恒；
+  自动止损触发后在途请求正常收尾、其余版本继续服务；
+  **回退作用域只限目标别名（其它别名继续承接同一版本、显式访问仍可用）；
+  回退后保留版本故障仍能降级到被撤销版本、目标全不可用才明确失败；
+  灰度（含随机加权并发）下同一 request_id 跨版本只真实推理一次且结果一致；
+  权重热更新后重复提交仍只推理一次；回退后旧版本缓存/去重结果不再命中；
+  回退瞬间在途去重被封闭（已等待者收尾、回退后的重复提交重新执行）；
+  在途请求收尾后分版本统计与整体统计在并发/重复提交/降级/背压下守恒**；
 - `test_batching.py`：并发合批（后端调用次数 < 请求数）；不同版本不混批；单项失败不污染批；
 - `test_admission.py`：排队超限明确拒绝；慢模型不阻塞快模型；
 - `test_fallback.py`：重试计一次用量；降级到可用版本；降级不可用明确失败；
@@ -137,13 +192,13 @@ uv run pytest tests/ -q -s
 gateway/
   config.py     配置（模型/版本/别名/权重/止损/降级链/合批/背压/缓存/重试）
   errors.py     原因码与 GatewayError
-  registry.py   路由与别名（加权分流、运行期可切换、可下线、止损摘除、回退）
+  registry.py   路由与别名（加权分流、运行期可切换、可下线、止损摘除、按别名回退）
   rollout.py    分版本观测统计与自动止损（熔断）
   backends.py   确定性本地后端（故障可注入）
   batching.py   动态合批器
   admission.py  资源隔离与背压
   cache.py      有界 LRU 结果缓存（可按版本清除）
-  dedup.py      请求去重（按版本作用域）与用量统计
+  dedup.py      请求去重（按 model+request_id，跨灰度版本；版本代际支持回退封闭）与用量统计
   gateway.py    编排：路由→缓存→去重→背压→合批→重试/降级→统计
   app.py        FastAPI 入口
   demo.py       演示配置

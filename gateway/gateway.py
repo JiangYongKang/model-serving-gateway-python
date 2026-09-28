@@ -1,4 +1,4 @@
-"""网关编排：路由 → 缓存 → 去重 → 背压 → 合批 → 重试/降级 → 统计。
+"""网关编排：路由 → 去重(跨灰度版本, 领导者查缓存) → 背压 → 合批 → 重试/降级 → 统计。
 
 统计守恒：每次 infer 调用 accepted +1，最终恰好落入
 succeeded / failed / rejected 之一；重试与降级不重复计 real_inferences。
@@ -14,7 +14,7 @@ from gateway.backends import BackendError, ItemFailure, LocalBackend
 from gateway.batching import BatchScheduler
 from gateway.cache import ResultCache
 from gateway.config import BreakerConfig, GatewayConfig, ModelSpec, VersionSpec
-from gateway.dedup import DedupRegistry, UsageStats
+from gateway.dedup import FOLLOWER, LEADER, DedupRegistry, UsageStats
 from gateway.errors import GatewayError, Reason
 from gateway.registry import Registry
 from gateway.rollout import BreakerRegistry, VersionStatsRegistry
@@ -137,29 +137,52 @@ class Gateway:
         request_id: str | None,
     ) -> str:
         model = model_spec.name
-        # 2. 缓存（键含解析后的具体版本）
-        cached = self._cache.get(model, vspec.version, prompt)
-        if cached is not None:
-            self._stats.cache_hits += 1
-            return cached
 
-        async def work() -> str:
+        async def run_work() -> tuple[str, str, bool]:
+            # 领导者先查本版本缓存：不同 request_id 但同规范化输入仍可命中缓存；
+            # 跟随者直接共享领导者结果，不再各自查缓存。
+            cached = self._cache.get(model, vspec.version, prompt)
+            if cached is not None:
+                self._stats.cache_hits += 1
+                return cached, vspec.version, True
             self._stats.real_inferences += 1  # 每个逻辑请求只计一次，重试不重复计
             executed = [vspec.version]  # 实际产生结果的版本（降级时更新）
+            performed = False
             try:
-                return await self._execute(model_spec, vspec, prompt, executed)
+                result = await self._execute(model_spec, vspec, prompt, executed)
+                performed = True
+                return result, executed[0], False
+            except Exception as exc:
+                performed = True
+                # 让去重层知道终态归属版本（回退封闭判定需要）
+                exc._dedup_version = executed[0]  # type: ignore[attr-defined]
+                raise
             finally:
-                self._version_stats.get(model, executed[0]).real_inferences += 1
+                # 只有真实推理才计入分版本用量；缓存命中不计
+                if performed:
+                    self._version_stats.get(model, executed[0]).real_inferences += 1
 
-        # 3. 去重（相同 request_id 只真实执行一次，作用域含解析后的版本）
+        # 带 request_id 的提交：去重优先——重复提交即使被灰度路由到不同版本，
+        # 也必须共享同一次真实推理与同一个结果（缓存检查只由领导者做一次）。
         if request_id is not None:
-            result, is_leader = await self._dedup.run_once(
-                (model, vspec.version), request_id, work
+            result, produced, role = await self._dedup.run_once(
+                model, vspec.version, request_id, run_work
             )
-            if not is_leader:
+            if role is FOLLOWER:
+                # 跟随者：复用在途/已完成结果（领导者发布时已写缓存）
                 self._stats.dedup_hits += 1
+            elif role is LEADER:
+                # 领导者且结果未被回退封闭：按实际产生结果的版本写入缓存
+                self._cache.put(model, produced, prompt, result)
+            # SEALED：领导者执行在回退期间完成，结果只返回给本提交，
+            # 不发布为去重结果、不写缓存。
             return result
-        return await work()
+
+        # 无 request_id：直接执行（内部先查本版本缓存）
+        result, produced, from_cache = await run_work()
+        if not from_cache:
+            self._cache.put(model, produced, prompt, result)
+        return result
 
     async def _execute(
         self,
@@ -174,7 +197,7 @@ class Gateway:
         try:
             # 5. 合批 + 重试
             try:
-                return await self._infer_with_retry(model, vspec, prompt)
+                return await self._infer_with_retry(model_spec, vspec, prompt)
             except ItemFailure as exc:
                 # 单项确定性失败：不重试、不降级
                 raise GatewayError(Reason.BACKEND_ERROR, str(exc)) from exc
@@ -196,8 +219,6 @@ class Gateway:
                 self._stats.fallbacks += 1
                 self._version_stats.get(model, vspec.version).fallbacks += 1
                 executed[0] = fb_version  # 实际推理由降级目标版本执行
-                # 缓存键使用实际产生结果的版本
-                self._cache.put(model, fb_version, prompt, result)
                 return result
             if model_spec.fallback:
                 raise GatewayError(
@@ -207,16 +228,17 @@ class Gateway:
         finally:
             await self._admission.release(model)
 
-    async def _infer_with_retry(self, model: str, vspec: VersionSpec, prompt: str) -> str:
+    async def _infer_with_retry(
+        self, model_spec: ModelSpec, vspec: VersionSpec, prompt: str
+    ) -> str:
+        model = model_spec.name
         backend = self._backends[(model, vspec.version)]
         last: BackendError | None = None
         for _ in range(self._config.retry.max_attempts):
             try:
-                result = await self._batch.submit(
+                return await self._batch.submit(
                     (model, vspec.version), prompt, backend.infer_batch
                 )
-                self._cache.put(model, vspec.version, prompt, result)
-                return result
             except ItemFailure:
                 raise
             except BackendError as exc:
@@ -242,14 +264,19 @@ class Gateway:
         self._registry.reset_trip(model, version)
 
     async def rollback(self, model: str, alias: str, version: str) -> list[str]:
-        """一键回退：别名收敛为单版本；撤销版本下线并清除其缓存与去重记录。
+        """一键回退：仅收敛目标别名；清除被撤销版本此前产生的缓存与去重结果。
 
-        在途请求已完成路由解析，不受回退影响，正常结束。
+        - 作用域只限目标别名：其它别名与降级链不受影响，继续承接同一版本；
+        - 被撤销版本不做全局下线：显式访问或经其它别名访问照常服务；
+        - 被撤销版本此前产生的缓存结果与重复提交记录不再被返回（版本代际 +1，
+          连在途共享的去重记录也一并封闭，只交给已在等待的提交正常收尾）；
+        - 在途请求已完成路由解析，不受回退影响，正常结束、计数不乱；
+        - 重试、降级、缓存容量上限与排队行为保持不变。
         """
         revoked = self._registry.rollback(model, alias, version)
         for v in revoked:
             self._cache.purge_version(model, v)
-            await self._dedup.purge_scope((model, v))
+            await self._dedup.revoke_version((model, v))
         return revoked
 
     def version_stats_snapshot(self) -> dict[str, dict[str, int]]:
