@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 
 import httpx
-import pytest
 
 from gateway.app import create_app
 from gateway.config import (
@@ -185,10 +184,12 @@ async def test_rollback_revokes_cache_and_dedup():
             *(gw.infer("m", f"post-{i}", request_id=f"post-{i}") for i in range(10))
         )
         assert all(r.startswith("m@v1#") for r in rs)
-        # 显式访问被撤销版本 -> 明确拒绝
-        with pytest.raises(GatewayError) as ei:
-            await gw.infer("m", "keep-v2", version_or_alias="v2", request_id="rb-v2-exp")
-        assert ei.value.reason is Reason.VERSION_RETIRED
+        # 回退只作用于别名：被撤销版本并未全局下线，显式访问仍可用
+        r_explicit = await gw.infer(
+            "m", "keep-v2", version_or_alias="v2", request_id="rb-v2-exp"
+        )
+        log.info("explicit access after rollback result=%s", r_explicit)
+        assert r_explicit.startswith("m@v2#")
         # 旧 request_id 的去重记录不再返回 v2 结果：经别名重新在 v1 执行
         r2 = await gw.infer("m", "keep-v2", request_id="rb-v2")
         assert r2.startswith("m@v1#")

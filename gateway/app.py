@@ -6,7 +6,8 @@
 - GET  /stats/versions 分版本观测统计
 - POST /admin/alias    切换别名（单版本，等价权重 1）
 - POST /admin/weights  灰度放量：别名 -> 多版本权重
-- POST /admin/rollback 一键回退：别名收敛为单版本，撤销其余在量版本
+- POST /admin/rollback 一键回退：目标别名收敛为单版本（仅作用于该别名，
+  清除被撤销版本的缓存/去重记录；其它别名、显式访问与降级链不受影响）
 - POST /admin/breaker  配置版本自动止损（失败比例 + 观察窗口）
 - POST /admin/retire   下线版本
 错误响应统一为 {"detail": {"reason": <原因码>, "message": <说明>}}。

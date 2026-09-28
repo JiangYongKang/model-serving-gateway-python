@@ -136,9 +136,15 @@ class Registry:
             self._retired.add((model, version))
 
     def rollback(self, model: str, alias: str, version: str) -> list[str]:
-        """一键回退：别名收敛为单版本，其余在量版本被撤销（下线）并返回列表。
+        """一键回退：仅把目标别名收敛为只由指定版本承接，返回被撤销的在量版本。
 
-        在途请求不受影响（它们已完成路由解析）；被撤销版本不再接受新请求。
+        作用域严格限定在该别名：
+        - 不修改任何其它别名的分流组成，其它别名仍按原配置承接版本；
+        - 不把被撤销版本标记为下线：显式访问依旧可用，重试/降级链依旧可
+          以把它作为目标（回退不能破坏既有降级链路）；
+        - 不改动自动止损状态；
+        - 在途请求不受影响（它们已完成路由解析）。
+        被撤销版本的缓存与去重结果由网关层按版本清除。
         """
         if model not in self._models:
             raise GatewayError(Reason.UNKNOWN_MODEL, f"unknown model: {model!r}")
@@ -150,7 +156,4 @@ class Registry:
             current = self._alias_weights.setdefault(model, {}).get(alias, {})
             revoked = [v for v, w in current.items() if w > 0 and v != version]
             self._alias_weights[model][alias] = {version: 1.0}
-            for v in revoked:
-                self._retired.add((model, v))
-                self._tripped.discard((model, v))
             return revoked

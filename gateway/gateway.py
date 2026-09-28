@@ -1,9 +1,12 @@
-"""网关编排：路由 → 缓存 → 去重 → 背压 → 合批 → 重试/降级 → 统计。
+"""网关编排：路由 → 去重(含缓存) → 背压 → 合批 → 重试/降级 → 统计。
 
 统计守恒：每次 infer 调用 accepted +1，最终恰好落入
 succeeded / failed / rejected 之一；重试与降级不重复计 real_inferences。
 分版本统计与整体口径一致：各版本 succeeded/failed/rejected/real_inferences/
 fallbacks 之和等于整体对应计数。
+
+去重作用域为 (model, request_id)：同一 request_id 即使在灰度加权分流中
+被解析到不同版本，也只有第一次提交真实推理，所有提交共享一致结果。
 """
 from __future__ import annotations
 
@@ -137,29 +140,40 @@ class Gateway:
         request_id: str | None,
     ) -> str:
         model = model_spec.name
-        # 2. 缓存（键含解析后的具体版本）
-        cached = self._cache.get(model, vspec.version, prompt)
-        if cached is not None:
-            self._stats.cache_hits += 1
-            return cached
 
-        async def work() -> str:
+        async def work() -> tuple[str, str]:
+            """领导者真实执行；返回 (结果, 实际产生结果的版本)。"""
+            # 缓存（键含解析后的具体版本）只在领导者路径查询：同一
+            # request_id 的跟随者直接共享领导者结果，避免灰度分流到不同
+            # 版本时先后命中不同版本缓存而返回不一致结果。
+            cached = self._cache.get(model, vspec.version, prompt)
+            if cached is not None:
+                self._stats.cache_hits += 1
+                return cached, vspec.version
             self._stats.real_inferences += 1  # 每个逻辑请求只计一次，重试不重复计
             executed = [vspec.version]  # 实际产生结果的版本（降级时更新）
             try:
-                return await self._execute(model_spec, vspec, prompt, executed)
+                result = await self._execute(model_spec, vspec, prompt, executed)
+                return result, executed[0]
             finally:
                 self._version_stats.get(model, executed[0]).real_inferences += 1
 
-        # 3. 去重（相同 request_id 只真实执行一次，作用域含解析后的版本）
+        # 去重作用域为 (model, request_id)：灰度下同一 request_id 即使被
+        # 解析到不同版本，也只有第一次提交真实推理，结果全局一致。
         if request_id is not None:
             result, is_leader = await self._dedup.run_once(
-                (model, vspec.version), request_id, work
+                model, request_id, vspec.version, work
             )
             if not is_leader:
                 self._stats.dedup_hits += 1
             return result
-        return await work()
+
+        # 无 request_id：保持缓存先行
+        cached = self._cache.get(model, vspec.version, prompt)
+        if cached is not None:
+            self._stats.cache_hits += 1
+            return cached
+        return (await work())[0]
 
     async def _execute(
         self,
@@ -242,14 +256,19 @@ class Gateway:
         self._registry.reset_trip(model, version)
 
     async def rollback(self, model: str, alias: str, version: str) -> list[str]:
-        """一键回退：别名收敛为单版本；撤销版本下线并清除其缓存与去重记录。
+        """一键回退：仅收敛目标别名；清除被撤销版本的缓存与去重记录。
 
-        在途请求已完成路由解析，不受回退影响，正常结束。
+        - 作用域仅限该别名：其它别名、显式版本访问、重试与降级链均不受影响；
+        - 被撤销版本此前产生的缓存结果与 request_id 去重记录被清除，
+          其在途去重条目的发布资格一并摘除（在途请求仍照常收尾，但旧
+          版本结果不会在回退后成为可复用记录）；
+        - 保留版本的缓存/去重记录原样保留。
         """
         revoked = self._registry.rollback(model, alias, version)
-        for v in revoked:
-            self._cache.purge_version(model, v)
-            await self._dedup.purge_scope((model, v))
+        if revoked:
+            for v in revoked:
+                self._cache.purge_version(model, v)
+            await self._dedup.purge_versions(model, revoked)
         return revoked
 
     def version_stats_snapshot(self) -> dict[str, dict[str, int]]:
